@@ -1,0 +1,59 @@
+# Python artifacts
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.pyre/
+.python-version
+
+# Virtual environments
+.venv/
+env/
+venv/
+
+# Distribution / packaging
+build/
+dist/
+*.egg-info/
+*.egg
+*.whl
+
+# Environment and secrets
+.env
+.env.*
+*.env
+
+# IDE/editor
+.vscode/
+.idea/
+*.sublime-project
+*.sublime-workspace
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Logs and coverage
+*.log
+coverage.xml
+htmlcov/
+.coverage
+.coverage.*
+
+# PyTorch / model checkpoints
+*.pt
+*.pth
+*.ckpt
+*.onnx
+
+# Uploaded or generated assets
+static/uploads/
+
+# Optional lockfiles
+poetry.lock
+
+# Temporary files
+*.tmp
+*.temp
+*~
