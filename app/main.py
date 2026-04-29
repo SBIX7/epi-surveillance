@@ -6,6 +6,7 @@ Routes : homepage, démarrage flux, upload vidéo/modèle, MJPEG stream.
 import time
 from pathlib import Path
 from typing import Generator, Optional
+import threading
 
 import cv2
 from fastapi import FastAPI, File, HTTPException, Request, UploadFile
@@ -53,6 +54,38 @@ class VideoSourceError(Exception):
 
 
 # ── Gestion de la capture ─────────────────────────────────────────────────
+class ThreadedCamera:
+    def __init__(self, src=0):
+        self.cap = cv2.VideoCapture(src)
+        if not self.cap.isOpened():
+            raise VideoSourceError("Impossible d'ouvrir la source vidéo.")
+        self.grabbed, self.frame = self.cap.read()
+        self.stopped = False
+        self.thread = threading.Thread(target=self.update, args=(), daemon=True)
+        self.thread.start()
+
+    def update(self):
+        while not self.stopped:
+            grabbed, frame = self.cap.read()
+            if grabbed:
+                self.grabbed, self.frame = grabbed, frame
+            else:
+                time.sleep(0.01)
+
+    def read(self):
+        return self.grabbed, self.frame
+
+    def release(self):
+        self.stopped = True
+        self.cap.release()
+        self.thread.join(timeout=1.0)
+        
+    def isOpened(self):
+        return self.cap.isOpened()
+        
+    def set(self, propId, value):
+        return self.cap.set(propId, value)
+
 def release_capture() -> None:
     """Libère proprement la capture OpenCV courante."""
     cap = stream_state.get("capture")
@@ -77,7 +110,7 @@ def get_capture() -> cv2.VideoCapture:
         return cap
 
     if stream_state["source"] == "camera":
-        cap = cv2.VideoCapture(0)
+        cap = ThreadedCamera(0)
     elif stream_state["video_path"]:
         cap = cv2.VideoCapture(str(stream_state["video_path"]))
     else:
@@ -305,6 +338,9 @@ def _generate_frames() -> Generator[bytes, None, None]:
             + encoded.tobytes()
             + b"\r\n"
         )
+        # Léger délai pour éviter de saturer le navigateur avec un flux trop rapide
+        # particulièrement lors de la lecture d'un fichier vidéo pré-enregistré.
+        time.sleep(0.01)
 
     release_capture()
 
