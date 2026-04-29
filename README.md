@@ -1,16 +1,62 @@
-# Prototype de Surveillance de Sécurité EPI
+# SmartSafety Vision — Surveillance EPI
 
-Ce projet est un prototype local de surveillance de sécurité utilisant FastAPI, Ultralytics YOLOv8 et OpenCV.
-Il analyse une webcam locale ou une vidéo MP4 uploadée, détecte les personnes et vérifie la présence d'équipements de protection individuelle (EPI).
+Projet de démonstration de détection d'équipements de protection individuelle (EPI) en temps réel.
+Le service utilise FastAPI, Ultralytics YOLOv8 et OpenCV pour analyser une webcam locale ou une vidéo uploadée.
 
-## Arborescence du projet
+## Fonctionnalités
 
+- Détection de personnes et d'EPI en direct.
+- Flux MJPEG pour afficher la vidéo annotée dans le navigateur.
+- Upload de vidéos MP4 pour analyse frame par frame.
+- Upload d'un modèle YOLOv8 personnalisé (`.pt`) pour des classes métier spécifiques.
+- Dashboard Web simple avec contrôles et état d'alerte.
+
+## Prérequis
+
+- Python 3.10 ou plus.
+- Accès à une webcam locale si vous utilisez le flux caméra.
+- `git` pour cloner le dépôt.
+
+## Installation
+
+```bash
+cd /home/mohamed/epi-surveillance
+python -m venv .venv
+source .venv/bin/activate
+pip install --upgrade pip
+pip install -r requirements.txt
 ```
-/mehdi_tp_fr
+
+> Optionnel : si vous utilisez `uv`, la commande `uv run uvicorn app.main:app --reload --host 0.0.0.0 --port 8000` fonctionne aussi.
+
+## Exécution
+
+```bash
+uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
+```
+
+Puis ouvrez :
+
+```text
+http://127.0.0.1:8000
+```
+
+## Utilisation
+
+- **Démarrer la caméra locale** : lance le flux webcam.
+- **Uploader une vidéo MP4** : analyse la vidéo et affiche les résultats.
+- **Uploader un modèle YOLOv8 personnalisé** : charge un fichier `.pt` adapté à votre cas d'usage.
+
+## Structure du projet
+
+```text
+/epi-surveillance
 ├── app
 │   ├── __init__.py
 │   ├── main.py
 │   └── vision.py
+├── assets
+│   └── demo_chantier.mp4
 ├── static
 │   ├── css
 │   │   └── styles.css
@@ -19,46 +65,27 @@ Il analyse une webcam locale ou une vidéo MP4 uploadée, détecte les personnes
 │   └── uploads
 ├── templates
 │   └── index.html
+├── .github
+│   └── workflows
+│       └── python-app.yml
 ├── pyproject.toml
+├── requirements.txt
 ├── README.md
-└── requirements.txt
+└── PIPELINE.md
 ```
 
-## Installation avec `uv`
+## Notes importantes
 
-1. Créez l'environnement virtuel :
+- Le fichier `.config/model_config.json` est local et n'est pas suivi par Git.
+- Les modèles `.pt` uploadés doivent rester dans `static/uploads/`.
+- Le fichier `yolov8n.pt` en racine est un exemple de modèle de base.
 
-```bash
-cd /home/mohamed/mehdi_tp_fr
-uv venv .venv
-```
+## Préparation GitHub
 
-2. Installez les dépendances :
+- Le dépôt contient désormais un workflow GitHub Actions dans `.github/workflows/python-app.yml`.
+- Le pipeline installe les dépendances et vérifie la compilation Python.
+- Vérifiez avant `git commit` que les fichiers volumineux comme les modèles sont bien intentionnels.
 
-```bash
-uv pip install -r requirements.txt
-```
+## Auteur
 
-3. Lancez le serveur local :
-
-```bash
-uv run uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
-```
-
-4. Ouvrez votre navigateur sur :
-
-```text
-http://127.0.0.1:8000
-```
-
-## Utilisation
-
-- `Démarrer la caméra locale` : lance le flux MJPEG depuis la webcam du serveur.
-- `Uploader une vidéo MP4` : upload une vidéo et lance l'analyse frame par frame.
-- `Charger un modèle YOLOv8 personnalisé` : téléversez votre `best.pt` spécialisé pour détecter casque, gilet, etc.
-
-## Remarques
-
-- Le backend utilise OpenCV pour capturer les frames et le modèle YOLOv8 pour l'inférence.
-- Si vous souhaitez des alertes EPI précises, chargez un modèle personnalisé `best.pt` entraîné sur les classes de sécurité.
-- En local, la caméra doit être accessible depuis le serveur, et le navigateur doit pouvoir afficher le flux MJPEG.
+SBII Mohamed

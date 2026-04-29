@@ -3,6 +3,7 @@ app/main.py — Serveur FastAPI SmartSafety Vision
 Routes : homepage, démarrage flux, upload vidéo/modèle, MJPEG stream.
 """
 
+import json
 import time
 from pathlib import Path
 from typing import Generator, Optional
@@ -20,7 +21,19 @@ from app.vision import ModelLoadError, PPE_MODEL_HF, SafetyGearEngine
 BASE_DIR   = Path(__file__).resolve().parent.parent
 UPLOAD_DIR = BASE_DIR / "static" / "uploads"
 DEMO_VIDEO = BASE_DIR / "assets" / "demo_chantier.mp4"
+CONFIG_DIR = BASE_DIR / ".config"
+MODEL_CONFIG_FILE = CONFIG_DIR / "model_config.json"
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+
+def get_asset_version() -> int:
+    """Retourne un numéro de version basé sur la date de modification des assets statiques."""
+    try:
+        css_file = BASE_DIR / "static" / "css" / "styles.css"
+        js_file = BASE_DIR / "static" / "js" / "script.js"
+        return int(max(css_file.stat().st_mtime, js_file.stat().st_mtime))
+    except Exception:
+        return int(time.time())
 
 # ── Application FastAPI ───────────────────────────────────────────────────
 app = FastAPI(
@@ -33,6 +46,35 @@ templates = Jinja2Templates(directory=str(BASE_DIR / "templates"))
 
 # ── Moteur de vision (singleton) ──────────────────────────────────────────
 # Lance automatiquement : keremberke/yolov8n-ppe-detection → yolov8n.pt
+# Charge en priorité le dernier modèle qui a été chargé
+
+def get_persisted_model_path() -> Optional[str]:
+    """Récupère le chemin du modèle persisté, s'il existe."""
+    try:
+        if MODEL_CONFIG_FILE.exists():
+            with open(MODEL_CONFIG_FILE, 'r') as f:
+                config = json.load(f)
+                model_path = config.get("model_path")
+                if model_path and Path(model_path).exists():
+                    return model_path
+    except Exception as e:
+        print(f"[SmartSafety] Erreur lecture config modèle : {e}")
+    return None
+
+def save_model_path(model_path: str) -> None:
+    """Sauvegarde le chemin du modèle chargé pour persistance."""
+    try:
+        config = {"model_path": str(model_path)}
+        with open(MODEL_CONFIG_FILE, 'w') as f:
+            json.dump(config, f)
+        print(f"[SmartSafety] Modèle sauvegardé en config : {model_path}")
+    except Exception as e:
+        print(f"[SmartSafety] Erreur écriture config modèle : {e}")
+
+# Charger le modèle persisté s'il existe
+# NOTE: Désactivé pour utiliser le modèle PPE HuggingFace qui est mieux entraîné
+# persisted_model = get_persisted_model_path()
+# vision = SafetyGearEngine(model_path=persisted_model if persisted_model else None)
 vision = SafetyGearEngine(model_path=None)
 
 if vision._epi_classes_available:
@@ -40,6 +82,9 @@ if vision._epi_classes_available:
 else:
     print("[SmartSafety] AVERTISSEMENT : aucune classe EPI dans le modele actuel.")
     print("[SmartSafety] Uploadez un modele PPE .pt via la sidebar pour activer la detection.")
+
+# ── État d'alerte ──────────────────────────────────────────────────────────
+alert_state = {"active": False}
 
 # ── État partagé du flux vidéo ────────────────────────────────────────────
 stream_state: dict = {
@@ -130,19 +175,34 @@ def get_capture() -> cv2.VideoCapture:
 
 @app.get("/", response_class=HTMLResponse, summary="Page principale du dashboard")
 def homepage(request: Request) -> HTMLResponse:
-    return templates.TemplateResponse(request, "index.html")
+    return templates.TemplateResponse(
+        request,
+        "index.html",
+        {
+            "request": request,
+            "asset_version": get_asset_version(),
+        },
+    )
 
 
-@app.get("/model_info", summary="Infos sur le modele YOLO actif")
-def model_info() -> JSONResponse:
-    """
-    Retourne les classes du modèle actif :
-    - person_classes : classes reconnues comme 'personne'
-    - epi_classes    : classes EPI (casque, gilet...)
-    - other_classes  : reste
-    Utile pour diagnostiquer un modèle custom.
-    """
-    return JSONResponse(vision.get_model_info())
+@app.get("/alert", summary="État d'alerte pour violations EPI")
+def get_alert() -> JSONResponse:
+    """Retourne True si des violations EPI sont détectées dans la frame actuelle."""
+    return JSONResponse({"alert": alert_state["active"]})
+
+
+@app.get("/debug", summary="Infos de debug du système")
+def get_debug() -> JSONResponse:
+    """Retourne l'état actuel du modèle et de l'alerte pour debug."""
+    model_info = vision.get_model_info()
+    return JSONResponse({
+        "model_info": model_info,
+        "alert_active": alert_state["active"],
+        "stream_state": {
+            "source": stream_state["source"],
+            "has_video_path": stream_state["video_path"] is not None,
+        }
+    })
 
 
 @app.post(
@@ -258,12 +318,33 @@ async def upload_model(file: UploadFile = File(...)) -> JSONResponse:
     timestamp   = int(time.time())
     target_path = UPLOAD_DIR / f"model_{timestamp}_{file.filename}"
     content     = await file.read()
-    target_path.write_bytes(content)
+    
+    # Verify file is not empty
+    if not content:
+        raise HTTPException(
+            status_code=400,
+            detail="Le fichier uploadé est vide. Vérifiez que le fichier .pt est valide.",
+        )
+    
+    try:
+        target_path.write_bytes(content)
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Erreur lors de la sauvegarde du fichier : {str(exc)}",
+        ) from exc
 
     try:
         vision.load_model(str(target_path))
+        # Sauvegarder le chemin du modèle chargé
+        save_model_path(str(target_path))
     except ModelLoadError as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Erreur lors du chargement du modèle : {type(exc).__name__} - {str(exc)}",
+        ) from exc
 
     info = vision.get_model_info()
     warnings = []
@@ -293,12 +374,23 @@ async def upload_model(file: UploadFile = File(...)) -> JSONResponse:
     })
 
 
+@app.post(
+    "/stop_stream",
+    summary="Arrêter le flux vidéo en cours",
+    response_description="Confirmation d'arrêt du flux",
+)
+async def stop_stream() -> JSONResponse:
+    """Arrête proprement la capture en cours et libère la caméra."""
+    release_capture()
+    return JSONResponse({"message": "Flux vidéo arrêté."})
+
+
 # ── Générateur MJPEG ──────────────────────────────────────────────────────
 def _generate_frames() -> Generator[bytes, None, None]:
     """
     Générateur Python qui :
       1. Lit une frame depuis la capture active.
-      2. Passe la frame dans `vision.predict_and_annotate()`.
+      2. Passe la frame dans `vision.predict_and_annotate()` (tous les 2 frames pour optimiser).
       3. Encode en JPEG et yield le chunk MJPEG.
       4. Libère la capture en fin de boucle (vidéo terminée ou déconnexion).
     """
@@ -309,6 +401,10 @@ def _generate_frames() -> Generator[bytes, None, None]:
         # on log et on sort proprement.
         print(f"[SmartSafety] VideoSourceError : {exc}")
         return
+
+    last_annotated = None
+    frame_count = 0
+    skip_frames = 2  # Traiter 1 frame sur 2 pour doubler la fluidité
 
     while capture.isOpened():
         ok, frame = capture.read()
@@ -322,11 +418,23 @@ def _generate_frames() -> Generator[bytes, None, None]:
             else:
                 break
 
-        try:
-            annotated = vision.predict_and_annotate(frame)
-        except Exception as exc:
-            print(f"[SmartSafety] Erreur annotation : {exc}")
-            annotated = frame.copy()
+        # Optimisation : traiter seulement tous les 'skip_frames' frames
+        if frame_count % skip_frames == 0:
+            try:
+                last_annotated, has_violations = vision.predict_and_annotate(frame)
+                alert_state["active"] = has_violations
+            except Exception as exc:
+                print(f"[SmartSafety] Erreur annotation : {exc}")
+                last_annotated = frame.copy()
+                alert_state["active"] = False
+        else:
+            # Réutiliser la dernière annotation pour les frames sautés
+            if last_annotated is None:
+                last_annotated = frame.copy()
+                alert_state["active"] = False
+
+        annotated = last_annotated
+        frame_count += 1
 
         ok2, encoded = cv2.imencode(".jpg", annotated, [cv2.IMWRITE_JPEG_QUALITY, 85])
         if not ok2:
@@ -338,9 +446,8 @@ def _generate_frames() -> Generator[bytes, None, None]:
             + encoded.tobytes()
             + b"\r\n"
         )
-        # Léger délai pour éviter de saturer le navigateur avec un flux trop rapide
-        # particulièrement lors de la lecture d'un fichier vidéo pré-enregistré.
-        time.sleep(0.01)
+        # Supprimer le sleep pour maximiser la fluidité (inference limite déjà)
+        # time.sleep(0.02)
 
     release_capture()
 

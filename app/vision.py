@@ -130,6 +130,13 @@ class SafetyGearEngine:
     # ── Seuil d'intersection ─────────────────────────────────────────────
     GEAR_OVERLAP_THRESHOLD: float = 0.02
 
+    # ── Seuil minimum pour afficher une boîte en sortie
+    DISPLAY_CONF_THRESHOLD: float = 0.08
+    DISPLAY_CONF_THRESHOLD_EPI_ONLY: float = 0.01
+
+    # ── Taille maximale de la frame traitée par inférence ────────────────
+    MAX_INFERENCE_DIM: int = 416
+
     # ─────────────────────────────────────────────────────────────────────
     def __init__(self, model_path: Optional[str] = None):
         self.model_path: str = model_path or PPE_MODEL_HF
@@ -179,8 +186,20 @@ class SafetyGearEngine:
         self.model_path = model_path or self.model_path
         if not self.model_path:
             raise ModelLoadError("Aucun chemin de modele fourni.")
+
+        path_obj = Path(self.model_path)
+        if path_obj.exists():
+            if not path_obj.is_file():
+                raise ModelLoadError(f"Le chemin spécifié n'est pas un fichier : {self.model_path}")
+            if not path_obj.stat().st_size > 0:
+                raise ModelLoadError(f"Le fichier modele est vide : {self.model_path}")
+            model_source = str(path_obj)
+        else:
+            model_source = self.model_path
+            print(f"[SmartSafety] Aucune archive locale trouvee pour '{self.model_path}', tentative de chargement distant via YOLO.")
+
         try:
-            self.model = YOLO(str(self.model_path))
+            self.model = YOLO(model_source)
             self.class_names = {int(k): str(v) for k, v in self.model.names.items()}
             self._epi_classes_available = self._check_epi_classes()
             self._person_class_ids: set = self._detect_person_class_ids()
@@ -191,8 +210,10 @@ class SafetyGearEngine:
             print(f"[SmartSafety] Classes : {all_cls}")
             print(f"[SmartSafety] Classes personne detectees : {[self.class_names[i] for i in self._person_class_ids]}")
             print(f"[SmartSafety] Classes EPI disponibles   : {self._epi_classes_available}")
+        except ModelLoadError:
+            raise  # Re-raise ModelLoadError as-is
         except Exception as exc:
-            raise ModelLoadError(f"Impossible de charger le modele YOLO : {exc}") from exc
+            raise ModelLoadError(f"Impossible de charger le modele YOLO : {type(exc).__name__} - {exc}") from exc
 
     # ── Validation des classes EPI ────────────────────────────────────────
     def _check_epi_classes(self) -> bool:
@@ -271,6 +292,38 @@ class SafetyGearEngine:
                 return group
         return None
 
+    def _get_available_gear_groups(self) -> set:
+        """
+        Retourne les groupes EPI réellement supportés par le modèle chargé.
+        """
+        available_groups = set()
+        for name in self.class_names.values():
+            lowname = name.lower()
+            for group, keywords in self.REQUIRED_GEAR_GROUPS.items():
+                if any(kw.lower() in lowname for kw in keywords):
+                    available_groups.add(group)
+                    break
+            for neg, group in self.NEGATIVE_GEAR_MAP.items():
+                if neg in lowname:
+                    available_groups.add(group)
+        return available_groups
+
+    def _resize_frame_for_inference(self, frame: np.ndarray) -> Tuple[np.ndarray, float]:
+        """
+        Redimensionne la frame avant l'inférence si elle dépasse la taille maximale.
+        Retourne la frame redimensionnée et le facteur d'échelle appliqué.
+        """
+        h, w = frame.shape[:2]
+        max_dim = self.MAX_INFERENCE_DIM
+        scale = min(1.0, max_dim / max(w, h))
+        if scale >= 1.0:
+            return frame, 1.0
+
+        new_w = max(1, int(round(w * scale)))
+        new_h = max(1, int(round(h * scale)))
+        resized = cv2.resize(frame, (new_w, new_h), interpolation=cv2.INTER_AREA)
+        return resized, scale
+
     # ── Algorithme d'intersection ─────────────────────────────────────────
     @staticmethod
     def _intersection_ratio(
@@ -348,22 +401,26 @@ class SafetyGearEngine:
         )
 
     # ── Inférence + annotation ────────────────────────────────────────────
-    def predict_and_annotate(self, frame: np.ndarray, conf: float = 0.25) -> np.ndarray:
+    def predict_and_annotate(self, frame: np.ndarray, conf: float = 0.25) -> tuple[np.ndarray, bool]:
         """
         Réalise l'inférence YOLOv8 et annote la frame :
           • VERT   — personne avec tous ses EPI / EPI positif détecté seul
           • ROUGE  — personne avec EPI manquant(s) / EPI négatif détecté seul
           • ORANGE — bounding box EPI détecté
 
-        Si le modèle n'a pas de classes EPI, affiche un bandeau d'avertissement.
-        Si le modèle n'a pas de classe personne (modèle EPI-only), chaque
-        détection EPI est annotée indépendamment (positif = vert, négatif = rouge).
+        Retourne (frame annotée, bool si violations détectées)
         """
         if self.model is None:
             raise ModelLoadError("Aucun modele YOLO charge.")
 
+        no_person_model = len(self._person_class_ids) == 0
+        frame_for_inference, scale = self._resize_frame_for_inference(frame)
+
         try:
-            results = self.model(frame, conf=conf, imgsz=640, verbose=False)[0]
+            results = self.model(frame_for_inference, conf=conf, imgsz=self.MAX_INFERENCE_DIM, verbose=False)[0]
+            if no_person_model and len(results.boxes) == 0 and conf > 0.01:
+                print("[SmartSafety] Modele EPI-only : aucun resultat, reessai avec conf=0.01")
+                results = self.model(frame_for_inference, conf=0.01, imgsz=self.MAX_INFERENCE_DIM, verbose=False)[0]
         except Exception as exc:
             raise RuntimeError(f"Erreur inference YOLO : {exc}") from exc
 
@@ -372,11 +429,24 @@ class SafetyGearEngine:
         neg_gears: List[Dict] = []   # EPI négatifs (absent détecté)
 
         # ── Tri des détections ───────────────────────────────────────────
+        display_conf_threshold = (
+            self.DISPLAY_CONF_THRESHOLD_EPI_ONLY if no_person_model else self.DISPLAY_CONF_THRESHOLD
+        )
+
         for box in results.boxes:
             cls   = int(box.cls[0])
             score = float(box.conf[0])
+            if score < display_conf_threshold:
+                continue
             label = self.class_names.get(cls, f"cls_{cls}")
-            xyxy  = box.xyxy[0].cpu().numpy().astype(int)
+            xyxy  = box.xyxy[0].cpu().numpy().astype(float)
+            if scale != 1.0:
+                xyxy /= scale
+            xyxy = np.clip(
+                xyxy,
+                [0, 0, 0, 0],
+                [frame.shape[1] - 1, frame.shape[0] - 1, frame.shape[1] - 1, frame.shape[0] - 1],
+            ).astype(int)
             bbox  = tuple(xyxy.tolist())
 
             # Détection personne : flexible — compare l'ID de classe
@@ -481,23 +551,14 @@ class SafetyGearEngine:
             found_groups -= forced_missing
 
             # Filtrer les groupes requis à ceux disponibles dans ce modèle
-            available_groups = set()
-            for g in self.REQUIRED_GEAR_GROUPS:
-                if any(
-                    self._is_positive_gear(n) or self._is_negative_gear(n)
-                    for n in self.class_names.values()
-                    if g.lower() in self._gear_groups_from_label(n)
-                       or any(kw.lower() in n.lower() for kw in self.REQUIRED_GEAR_GROUPS.get(g, []))
-                       or any(g.lower() in (self.NEGATIVE_GEAR_MAP.get(neg, "")).lower()
-                              for neg in self.NEGATIVE_GEAR_MAP
-                              if neg in n.lower())
-                ):
-                    available_groups.add(g)
-
-            required = available_groups if available_groups else set(self.REQUIRED_GEAR_GROUPS.keys())
+            available_groups = self._get_available_gear_groups()
+            required = available_groups
             missing  = list((required - found_groups) | forced_missing)
 
-            if missing:
+            if not required:
+                color      = self.COLOR_GEAR
+                label_text = "EPI modele partiel"
+            elif missing:
                 color      = self.COLOR_MISSING
                 label_text = "MANQUANT: " + ", ".join(missing)
             else:
@@ -524,4 +585,7 @@ class SafetyGearEngine:
                 self.COLOR_WARN, 2, cv2.LINE_AA,
             )
 
-        return annotation
+        has_violations = len(neg_gears) > 0
+        if has_violations:
+            print(f"[SmartSafety] ALERTE VIOLATION : {len(neg_gears)} EPI manquant(s) détecté(s)")
+        return annotation, has_violations

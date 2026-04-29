@@ -23,6 +23,7 @@ dist/
 .env
 .env.*
 *.env
+.config/
 
 # IDE/editor
 .vscode/

@@ -22,6 +22,8 @@ const videoPlaceholder = document.getElementById("videoPlaceholder");
 const liveBadge = document.getElementById("liveBadge");
 const overlayTime = document.getElementById("overlayTime");
 const toastContainer = document.getElementById("toastContainer");
+const stopStreamBtn = document.getElementById("stopStreamBtn");
+const modelStatusText = document.getElementById("modelStatusText");
 const themeToggleBtn = document.getElementById("themeToggleBtn");
 const themeIcon = document.getElementById("themeIcon");
 
@@ -133,6 +135,33 @@ function activateStream() {
   videoStream.src = "/video_feed?" + Date.now(); // cache-bust
   videoPlaceholder.classList.add("hidden");
   liveBadge.classList.add("active");
+  if (stopStreamBtn) {
+    stopStreamBtn.disabled = false;
+  }
+  startAlertPolling();
+}
+
+function deactivateStream() {
+  if (stopStreamBtn) {
+    stopStreamBtn.disabled = true;
+  }
+  videoStream.src = "";
+  videoPlaceholder.classList.remove("hidden");
+  liveBadge.classList.remove("active");
+  stopAlertPolling();
+}
+
+async function stopStream() {
+  try {
+    await fetch("/stop_stream", { method: "POST" });
+    setStatus("Flux vidéo arrêté.", "info");
+    showToast("Flux vidéo arrêté.", "info");
+  } catch (err) {
+    setStatus("Impossible d'arrêter le flux.", "danger");
+    showToast("Impossible d'arrêter le flux.", "danger");
+  } finally {
+    deactivateStream();
+  }
 }
 
 /**
@@ -169,6 +198,10 @@ cameraButton.addEventListener("click", () =>
 demoButton.addEventListener("click", () =>
   startStream("/start_demo", "Vidéo de démonstration lancée.")
 );
+
+if (stopStreamBtn) {
+  stopStreamBtn.addEventListener("click", stopStream);
+}
 
 /* ════════════════════════════════════════════
    GESTION DES FICHIERS — AFFICHAGE DU NOM
@@ -290,15 +323,33 @@ modelForm.addEventListener("submit", async e => {
     return;
   }
 
+  // Validate file size (max 500MB)
+  const maxSize = 500 * 1024 * 1024;
+  if (file.size > maxSize) {
+    showToast(`Le fichier est trop volumineux (${(file.size / 1024 / 1024).toFixed(1)}MB). Maximum 500MB.`, "warning");
+    return;
+  }
+
   setStatus("Chargement du modèle…", "info");
   const formData = new FormData();
   formData.append("file", file);
 
   try {
     const res = await fetch("/upload_model", { method: "POST", body: formData });
-    const data = await res.json();
+    
+    if (!res.ok) {
+      let errorDetail = "Erreur pendant le chargement du modèle.";
+      try {
+        const errorData = await res.json();
+        errorDetail = errorData.detail || errorData.message || errorDetail;
+      } catch (e) {
+        // Si la réponse n'est pas JSON, utilise le texte d'état HTTP
+        errorDetail = `Erreur ${res.status}: ${res.statusText}`;
+      }
+      throw new Error(errorDetail);
+    }
 
-    if (!res.ok) throw new Error(data.detail || "Erreur pendant le chargement du modèle.");
+    const data = await res.json();
 
     const msg = `Modèle chargé : ${data.model_name}`;
     const allOk = data.person_detected && data.epi_classes_available;
@@ -308,7 +359,7 @@ modelForm.addEventListener("submit", async e => {
     // Affiche chaque avertissement détaillé retourné par le backend
     if (data.warnings && data.warnings.length > 0) {
       for (const warn of data.warnings) {
-        showToast(warn, "danger", 10000);
+        showToast(warn, "warning", 10000);
       }
     }
 
@@ -323,7 +374,13 @@ modelForm.addEventListener("submit", async e => {
         7000
       );
     }
+
+    // Reset form
+    modelFileInput.value = "";
+    updateFileDisplay(modelFileInput, modelFileName, "model");
+
   } catch (err) {
+    console.error("[SmartSafety] Erreur upload modèle:", err);
     setStatus(err.message, "danger");
     showToast(err.message, "danger");
   }
@@ -335,30 +392,108 @@ modelForm.addEventListener("submit", async e => {
 videoStream.addEventListener("error", () => {
   if (!videoStream.src || videoStream.src === window.location.href) return;
   showToast("Le flux vidéo s'est interrompu.", "warning");
-  liveBadge.classList.remove("active");
+  deactivateStream();
 });
 
-/* ════════════════════════════════════════════
-   THEME TOGGLE (LIGHT / DARK)
-════════════════════════════════════════════ */
-function initTheme() {
-  const savedTheme = localStorage.getItem("theme");
-  const prefersLight = window.matchMedia("(prefers-color-scheme: light)").matches;
-  
-  if (savedTheme === "light" || (!savedTheme && prefersLight)) {
-    document.documentElement.setAttribute("data-theme", "light");
-    if (themeIcon) {
-      themeIcon.classList.remove("fa-moon");
-      themeIcon.classList.add("fa-sun");
+async function fetchModelInfo() {
+  try {
+    const res = await fetch("/model_info");
+    const data = await res.json();
+
+    if (!res.ok) {
+      throw new Error(data.detail || "Impossible de lire les infos du modèle.");
     }
-  } else {
-    document.documentElement.removeAttribute("data-theme");
-    if (themeIcon) {
-      themeIcon.classList.remove("fa-sun");
-      themeIcon.classList.add("fa-moon");
+
+    if (!data.epi_classes_available) {
+      setStatus("Modèle chargé sans classes EPI.", "danger");
+      if (modelStatusText) {
+        modelStatusText.textContent = "Modèle chargé sans classes EPI.";
+      }
+      showToast("Le modèle actuel ne reconnaît pas d'EPI.", "warning", 9000);
+    } else if (!data.person_detected) {
+      setStatus("Modèle EPI-only chargé.", "warning");
+      if (modelStatusText) {
+        modelStatusText.textContent = "Modèle EPI-only : détection d'équipement sans personne.";
+      }
+      showToast("Modèle EPI-only détecté : affichage des EPI sans association à une personne.", "warning", 9000);
+    } else {
+      setStatus("Modèle EPI prêt.", "success");
+      if (modelStatusText) {
+        modelStatusText.textContent = `Personne : ${data.person_classes.join(", ")} · EPI : ${data.epi_classes.join(", ")}`;
+      }
+    }
+  } catch (err) {
+    console.error(err);
+    if (modelStatusText) {
+      modelStatusText.textContent = "Impossible de récupérer les infos du modèle.";
     }
   }
 }
+
+/* ════════════════════════════════════════════
+   ALERTE SONORE POUR VIOLATIONS EPI
+════════════════════════════════════════════ */
+let alertInterval = null;
+
+/**
+ * Joue un bip simple via Web Audio API.
+ */
+function playBeep() {
+  try {
+    const audioContext = new (window.AudioContext || window.webkitAudioContext)();
+    const oscillator = audioContext.createOscillator();
+    const gainNode = audioContext.createGain();
+
+    oscillator.connect(gainNode);
+    gainNode.connect(audioContext.destination);
+
+    oscillator.frequency.setValueAtTime(800, audioContext.currentTime);
+    oscillator.type = 'square';
+    gainNode.gain.setValueAtTime(0.3, audioContext.currentTime);
+
+    oscillator.start(audioContext.currentTime);
+    oscillator.stop(audioContext.currentTime + 0.2);
+    console.log("[🔊 BEEEP] Son joué avec succès!");
+  } catch (err) {
+    console.warn("Impossible de jouer le bip :", err);
+  }
+}
+
+/**
+ * Vérifie l'état d'alerte toutes les secondes.
+ */
+async function checkAlert() {
+  try {
+    const res = await fetch("/alert");
+    if (!res.ok) return;
+    const data = await res.json();
+    if (data.alert) {
+      console.log("[🔔 VIOLATION DÉTECTÉE] EPI manquant(s) détecté(s) — Déclenchement alerte sonore.");
+      playBeep();
+    }
+  } catch (err) {
+    console.warn("Erreur vérification alerte :", err);
+  }
+}
+
+/**
+ * Démarre la vérification d'alerte.
+ */
+function startAlertPolling() {
+  if (alertInterval) clearInterval(alertInterval);
+  alertInterval = setInterval(checkAlert, 1000);
+}
+
+/**
+ * Arrête la vérification d'alerte.
+ */
+function stopAlertPolling() {
+  if (alertInterval) {
+    clearInterval(alertInterval);
+    alertInterval = null;
+  }
+}
+
 
 if (themeToggleBtn) {
   themeToggleBtn.addEventListener("click", () => {
@@ -377,5 +512,6 @@ if (themeToggleBtn) {
   });
 }
 
+fetchModelInfo();
 initTheme();
 
